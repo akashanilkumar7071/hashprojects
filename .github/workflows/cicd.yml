@@ -151,15 +151,13 @@ cleanup:
       - name: Clean up old images
         run: |
           TOKEN=$(curl -s -H "Content-Type: application/json" \
-            -X POST -d '-d '{"username":"${{ secrets.DOCKERHUB_USERNAME }}","password":"${{ secrets.DOCKERHUB_TOKEN }}"}' \
+            -X POST -d '{"username":"${{ secrets.DOCKERHUB_USERNAME }}","password":"${{ secrets.DOCKERHUB_TOKEN }}"}' \
             https://hub.docker.com/v2/users/login/ | jq -r .token)
-
           curl -s -H "Authorization: JWT $TOKEN" \
             "https://hub.docker.com/v2/repositories/akash7071/nodejs-cicd-app/tags/?page_size=100" \
             | jq -r '.results[5:][].name' \
             | xargs -I {} curl -X DELETE \
               -H "Authorization: JWT $TOKEN" \
               "https://hub.docker.com/v2/repositories/akash7071/nodejs-cicd-app/tags/{}"
-```
 
 
