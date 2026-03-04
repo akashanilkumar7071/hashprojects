@@ -21,7 +21,7 @@ spec:
     spec:
       containers:
       - name: nodejs-app
-        image: akashanilkumar7071/nodejs-cicd-app:latest
+        image: akash7071/nodejs-cicd-app:latest
         ports:
         - containerPort: 3000
         readinessProbe:
