@@ -10,7 +10,6 @@ env:
   DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/nodejs-cicd-app
 
 jobs:
-  # ─── JOB 1: Test ───────────────────────────────────────────
   test:
     name: Install & Test
     runs-on: ubuntu-latest
@@ -30,21 +29,11 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Upload coverage
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage-report
-          path: coverage/
-
-  # ─── JOB 2: Build & Push Docker Image ──────────────────────
   build:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main'
-    outputs:
-      image_tag: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -58,26 +47,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKER_IMAGE }}
-          tags: |
-            type=sha,prefix=sha-
-            type=raw,value=latest
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:latest
+            ${{ env.DOCKER_IMAGE }}:sha-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ─── JOB 3: Deploy to Kubernetes ───────────────────────────
   deploy:
     name: Deploy to Kubernetes
     runs-on: ubuntu-latest
@@ -92,24 +72,18 @@ jobs:
         with:
           version: 'latest'
 
-      - name: Configure kubectl (EC2 kubeconfig)
+      - name: Configure kubectl
         run: |
           mkdir -p $HOME/.kube
           echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
 
-      - name: Save current deployment (for rollback)
-        id: save_deployment
-        run: |
-          kubectl get deployment nodejs-app -o yaml > /tmp/previous-deployment.yaml 2>/dev/null || echo "No existing deployment"
-          CURRENT_IMAGE=$(kubectl get deployment nodejs-app -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "none")
-          echo "current_image=$CURRENT_IMAGE" >> $GITHUB_OUTPUT
+      - name: Check cluster connection
+        run: kubectl get nodes
 
-      - name: Update image in deployment manifest
+      - name: Update image in deployment
         run: |
-          IMAGE_TAG="${{ env.DOCKER_IMAGE }}:sha-${{ github.sha }}"
-          sed -i "s|YOUR_DOCKERHUB_USERNAME/nodejs-cicd-app:latest|$IMAGE_TAG|g" k8s/deployment.yaml
-          echo "Deploying image: $IMAGE_TAG"
+          sed -i "s|YOUR_DOCKERHUB_USERNAME/nodejs-cicd-app:latest|${{ env.DOCKER_IMAGE }}:sha-${{ github.sha }}|g" k8s/deployment.yaml
 
       - name: Apply Kubernetes manifests
         run: |
@@ -117,47 +91,45 @@ jobs:
           kubectl apply -f k8s/service.yaml
 
       - name: Wait for rollout
-        id: rollout
         run: |
           kubectl rollout status deployment/nodejs-app --timeout=120s
 
-      - name: Verify deployment health
+      - name: Verify pods are running
         run: |
           kubectl get pods -l app=nodejs-app
           kubectl get services
 
       - name: Rollback on failure
-        if: failure() && steps.save_deployment.outputs.current_image != 'none'
+        if: failure()
         run: |
-          echo "❌ Deployment failed! Rolling back..."
-          kubectl rollout undo deployment/nodejs-app
-          kubectl rollout status deployment/nodejs-app --timeout=60s
-          echo "✅ Rollback complete. Reverted to previous version."
-
-      - name: Notify deployment result
-        if: always()
-        run: |
-          if [ "${{ job.status }}" == "success" ]; then
-            echo "✅ Deployment successful!"
+          echo "Deployment failed! Attempting rollback..."
+          REVISION=$(kubectl rollout history deployment/nodejs-app 2>/dev/null | tail -2 | head -1 | awk '{print $1}')
+          if [ -n "$REVISION" ] && [ "$REVISION" -gt "1" ]; then
+            kubectl rollout undo deployment/nodejs-app
+            echo "Rollback complete"
           else
-            echo "❌ Deployment failed - rollback was triggered"
+            echo "No previous revision to rollback to"
           fi
-cleanup:
+
+  cleanup:
     name: Cleanup Old Docker Images
     runs-on: ubuntu-latest
     needs: deploy
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Clean up old images
+      - name: Delete old images keep last 5
         run: |
           TOKEN=$(curl -s -H "Content-Type: application/json" \
             -X POST -d '{"username":"${{ secrets.DOCKERHUB_USERNAME }}","password":"${{ secrets.DOCKERHUB_TOKEN }}"}' \
             https://hub.docker.com/v2/users/login/ | jq -r .token)
-          curl -s -H "Authorization: JWT $TOKEN" \
-            "https://hub.docker.com/v2/repositories/akash7071/nodejs-cicd-app/tags/?page_size=100" \
-            | jq -r '.results[5:][].name' \
-            | xargs -I {} curl -X DELETE \
+          TAGS=$(curl -s \
+            -H "Authorization: JWT $TOKEN" \
+            "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/nodejs-cicd-app/tags/?page_size=100" \
+            | jq -r '.results | sort_by(.last_updated) | reverse | .[5:][].name')
+          for TAG in $TAGS; do
+            echo "Deleting tag: $TAG"
+            curl -s -X DELETE \
               -H "Authorization: JWT $TOKEN" \
-              "https://hub.docker.com/v2/repositories/akash7071/nodejs-cicd-app/tags/{}"
-
-
+              "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/nodejs-cicd-app/tags/$TAG/"
+          done
+          echo "Cleanup complete. Kept latest 5 images."
